@@ -1,0 +1,122 @@
+# Streams RAW data live over BLE, records 10 seconds of data, and plots it using matplotlib
+
+from mbientlab.metawear import MetaWear, libmetawear, parse_value
+from mbientlab.metawear.cbindings import *
+from time import sleep
+import matplotlib.pyplot as plt
+
+# --- CONFIGURATION ---
+SENSORS = {
+    "Leg": "C1:6F:3F:C1:2F:1A",
+    "Arm": "C6:0D:15:58:CE:83"
+}
+
+# Data storage dictionary to keep Leg and Arm datasets separate
+sensor_data = {
+    "Leg": {"t": [], "x": [], "y": [], "z": []},
+    "Arm": {"t": [], "x": [], "y": [], "z": []}
+}
+
+# We need a way to pass the sensor name into our data callback functions
+# MbientLab handles this by creating separate callback functions
+def create_handler(sensor_name):
+    def sensor_data_handler(context, data):
+        accel = parse_value(data)
+        
+        # Append incoming data to the correct sub-dictionary
+        sensor_data[sensor_name]["t"].append(data.contents.epoch)
+        sensor_data[sensor_name]["x"].append(accel.x)
+        sensor_data[sensor_name]["y"].append(accel.y)
+        sensor_data[sensor_name]["z"].append(accel.z)
+        
+    return FnVoid_VoidP_DataP(sensor_data_handler)
+
+# --- CONNECTIONS & CONFIGURATION ---
+connected_devices = {}
+callbacks = {}
+signals = {}
+
+print("--- NuraKick Dual-Node Streaming System ---")
+
+try:
+    # 1. Connect to both sensors
+    for name, mac in SENSORS.items():
+        print(f"Connecting to {name}...")
+        device = MetaWear(mac)
+        device.connect()
+        connected_devices[name] = device
+        print(f"Connected to {name} successfully.")
+
+    # 2. Configure Accelerometers (50Hz, +/- 8G) on both boards
+    for name, device in connected_devices.items():
+        libmetawear.mbl_mw_acc_set_odr(device.board, 50.0)
+        libmetawear.mbl_mw_acc_set_range(device.board, 8.0)
+        libmetawear.mbl_mw_acc_write_acceleration_config(device.board)
+
+        # Create unique callback handler for this specific sensor
+        callbacks[name] = create_handler(name)
+        signals[name] = libmetawear.mbl_mw_acc_get_acceleration_data_signal(device.board)
+        libmetawear.mbl_mw_datasignal_subscribe(signals[name], None, callbacks[name])
+
+    # 3. Start sampling simultaneously
+    print("\nTriggering synchronized sampling...")
+    for name, device in connected_devices.items():
+        libmetawear.mbl_mw_acc_enable_acceleration_sampling(device.board)
+        libmetawear.mbl_mw_acc_start(device.board)
+
+    print("\n--- STREAMING LIVE DATA ---")
+    print("Move both sensors around! Capturing 10 seconds of data...")
+    sleep(10.0)
+
+finally:
+    # 4. Safe Disconnect Loop (The Soft Reset)
+    print("\nStopping streams and safely closing connections...")
+    for name, device in connected_devices.items():
+        try:
+            libmetawear.mbl_mw_acc_stop(device.board)
+            libmetawear.mbl_mw_acc_disable_acceleration_sampling(device.board)
+            libmetawear.mbl_mw_datasignal_unsubscribe(signals[name])
+            
+            # Instead of a hard Windows disconnect, we tell the board to gracefully reset
+            libmetawear.mbl_mw_debug_reset(device.board)
+            print(f"Reset command sent to {name}.")
+        except Exception as e:
+            print(f"Error disconnecting {name}: {e}")
+            
+    # Give the C++ background threads 2 seconds to cleanly exit before we try to draw a graph
+    sleep(2.0)
+
+# --- VISUALIZATION PLOT ---
+print("\nGenerating synchronized visualization...")
+
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
+
+# Plot Leg Data
+leg_t = sensor_data["Leg"]["t"]
+if len(leg_t) > 0:
+    leg_start = leg_t[0]
+    leg_relative = [(t - leg_start) / 1000.0 for t in leg_t]
+    ax1.plot(leg_relative, sensor_data["Leg"]["x"], label='X-Axis', color='red', alpha=0.7)
+    ax1.plot(leg_relative, sensor_data["Leg"]["y"], label='Y-Axis', color='green', alpha=0.7)
+    ax1.plot(leg_relative, sensor_data["Leg"]["z"], label='Z-Axis', color='blue', alpha=0.7)
+ax1.set_title("Leg Sensor Kinematics")
+ax1.set_ylabel("Acceleration (G-Forces)")
+ax1.grid(True, alpha=0.3)
+ax1.legend(loc='upper right')
+
+# Plot Arm Data
+arm_t = sensor_data["Arm"]["t"]
+if len(arm_t) > 0:
+    arm_start = arm_t[0]
+    arm_relative = [(t - arm_start) / 1000.0 for t in arm_t]
+    ax2.plot(arm_relative, sensor_data["Arm"]["x"], label='X-Axis', color='red', alpha=0.7)
+    ax2.plot(arm_relative, sensor_data["Arm"]["y"], label='Y-Axis', color='green', alpha=0.7)
+    ax2.plot(arm_relative, sensor_data["Arm"]["z"], label='Z-Axis', color='blue', alpha=0.7)
+ax2.set_title("Arm Sensor Kinematics")
+ax2.set_xlabel("Time (Seconds)")
+ax2.set_ylabel("Acceleration (G-Forces)")
+ax2.grid(True, alpha=0.3)
+ax2.legend(loc='upper right')
+
+plt.tight_layout()
+plt.show()

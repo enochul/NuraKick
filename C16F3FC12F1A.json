@@ -1,0 +1,113 @@
+from mbientlab.metawear import MetaWear, libmetawear, parse_value
+from mbientlab.metawear.cbindings import *
+from time import sleep
+import threading
+import csv
+import datetime
+
+SENSORS = {
+    # "Leg": "C1:6F:3F:C1:2F:1A",
+    "Arm": "C6:0D:15:58:CE:83"
+}
+
+print("=== NuraKick Data Extraction ===")
+
+connected_devices = {}
+callbacks = [] 
+
+try:
+    for name, mac in SENSORS.items():
+        print(f"\nConnecting to {name}...")
+        device = MetaWear(mac)
+        device.connect()
+        connected_devices[name] = device
+        
+        try:
+            with open(f"{name}_state.bin", "rb") as f:
+                content = f.read()
+                buffer = (c_ubyte * len(content)).from_buffer_copy(content)
+                libmetawear.mbl_mw_metawearboard_deserialize(device.board, buffer, len(content))
+            print(f"  -> State restored from {name}_state.bin")
+        except FileNotFoundError:
+            print(f"  -> ERROR: No state file found for {name}. Cannot download data.")
+            continue
+
+    for name, device in connected_devices.items():
+        print(f"\n--- Initiating Download for {name} ---")
+
+        libmetawear.mbl_mw_logging_stop(device.board)
+        libmetawear.mbl_mw_logging_flush_page(device.board)
+        sleep(1.0) 
+        
+        dataset = [] 
+        
+        def data_handler(context, data):
+            try:
+                quat = parse_value(data)
+                dataset.append({
+                    "epoch_ms": data.contents.epoch,
+                    "w": quat.w,
+                    "x": quat.x,
+                    "y": quat.y,
+                    "z": quat.z
+                })
+            except Exception as e:
+                # If ctypes fails to parse the quaternion, it will now shout at us instead of failing silently.
+                print(f"  -> Silent Parser Error: {e}")
+
+        data_cb = FnVoid_VoidP_DataP(data_handler)
+        callbacks.append(data_cb)
+
+        # Reach directly into the deserialized memory and grab Logger ID 0.
+        logger = libmetawear.mbl_mw_logger_lookup_id(device.board, 0)
+        
+        if not logger:
+            print("  -> ERROR: Logger ID 0 not found. State file might be corrupted.")
+            continue
+            
+        libmetawear.mbl_mw_logger_subscribe(logger, None, data_cb)
+        print("  -> Python successfully subscribed directly to Logger ID 0.")
+
+        download_done = threading.Event()
+        
+        def progress_handler(context, entries_left, total_entries):
+            if entries_left % 500 == 0 or entries_left == 0:
+                print(f"  -> Downloading: {total_entries - entries_left}/{total_entries} packets...")
+            if entries_left == 0:
+                download_done.set()
+
+        prog_cb = FnVoid_VoidP_UInt_UInt(progress_handler)
+        callbacks.append(prog_cb)
+        
+        dl_handler = LogDownloadHandler(context=None, 
+                                        received_progress_update=prog_cb, 
+                                        received_unknown_entry=cast(None, FnVoid_VoidP_UByte_Long_UByteP_UByte), 
+                                        received_unhandled_entry=cast(None, FnVoid_VoidP_DataP))
+
+        libmetawear.mbl_mw_logging_download(device.board, 100, byref(dl_handler))
+        download_done.wait() 
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"NuraKick_{name}_Data_{timestamp}.csv"
+        
+        print(f"\n  -> Writing {len(dataset)} rows to {filename}...")
+        with open(filename, mode='w', newline='') as file:
+            writer = csv.DictWriter(file, fieldnames=["epoch_ms", "w", "x", "y", "z"])
+            writer.writeheader()
+            writer.writerows(dataset)
+            
+        print(f"  -> File saved successfully.")
+
+except Exception as e:
+    print(f"\nCRITICAL ERROR: {e}")
+
+finally:
+    print("\nCleaning up and safely disconnecting...")
+    for name, device in connected_devices.items():
+        try:
+            libmetawear.mbl_mw_logging_stop(device.board)
+            libmetawear.mbl_mw_debug_reset(device.board)
+            sleep(1.0)
+            print(f"  -> {name} wiped and safely disconnected.")
+        except Exception:
+            pass

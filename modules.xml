@@ -1,0 +1,102 @@
+from mbientlab.metawear import MetaWear, libmetawear, parse_value
+from mbientlab.metawear.cbindings import *
+from time import sleep
+from vpython import box, cylinder, compound, vector, rate, color, canvas
+
+MAC_ADDRESS = "C6:0D:15:58:CE:83"  # Arm Sensor
+
+# --- 3D SCENE & SENSOR SHAPE ---
+scene = canvas(title='NuraKick Quaternion Fusion', width=800, height=600, background=color.gray(0.1))
+
+# Custom Shape (Short X, Long Z, Button in corner)
+body_length = 3.0
+body_width = 4.0
+body_height = 0.8
+main_body = box(length=body_length, width=body_width, height=body_height, color=color.white)
+
+button_radius = 0.4
+button_height = 0.1 
+button_x = (body_length / 2) - 0.6  
+button_y = (body_height / 2)        
+button_z = (body_width / 2) - 0.6   
+
+sensor_button = cylinder(pos=vector(button_x, button_y, button_z),
+                         axis=vector(0, button_height, 0), 
+                         radius=button_radius, color=color.gray(0.5))
+
+sensor_model = compound([main_body, sensor_button])
+
+# Dictionary for 4D Quaternions
+current_quat = {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
+
+def sensor_fusion_handler(context, data):
+    quat = parse_value(data)
+    current_quat["w"] = quat.w
+    current_quat["x"] = quat.x
+    current_quat["y"] = quat.y
+    current_quat["z"] = quat.z
+
+callback = FnVoid_VoidP_DataP(sensor_fusion_handler)
+
+# --- HARDWARE CONNECTION ---
+print("Connecting to sensor...")
+device = MetaWear(MAC_ADDRESS)
+device.connect()
+print("Connected! Waking up Bosch Sensor Fusion (IMU_PLUS Mode)...")
+
+try:
+    # Use IMU_PLUS to ignore magnetic interference from your laptop
+    libmetawear.mbl_mw_sensor_fusion_set_mode(device.board, SensorFusionMode.IMU_PLUS)
+    libmetawear.mbl_mw_sensor_fusion_write_config(device.board)
+
+    # Subscribe to QUATERNIONS instead of Euler Angles
+    signal = libmetawear.mbl_mw_sensor_fusion_get_data_signal(device.board, SensorFusionData.QUATERNION)
+    libmetawear.mbl_mw_datasignal_subscribe(signal, None, callback)
+
+    libmetawear.mbl_mw_sensor_fusion_enable_data(device.board, SensorFusionData.QUATERNION)
+    libmetawear.mbl_mw_sensor_fusion_start(device.board)
+
+    print("\n--- 3D QUATERNION RENDER ACTIVE ---")
+
+    while True:
+        rate(100)
+        
+        raw_w = current_quat["w"]
+        raw_x = current_quat["x"]
+        raw_y = current_quat["y"]
+        raw_z = current_quat["z"]
+        
+        # ========================================================
+        # DEBUG ROUTING MATRIX: Swap these if the axes are wrong!
+        # Because VPython (Y is Up) and Hardware (Z is Up) differ, 
+        # you may need to map raw_y to VPython's Z, etc.
+        # Try making negative if it rotates backward.
+        # ========================================================
+        w = raw_w
+        x = -raw_y   # Try swapping with raw_y or raw_z
+        y = raw_z   # Try swapping with raw_x or raw_y
+        z = -raw_x  # Try making positive or negative
+        
+        # Quaternion to 3D Rotation Math (Do not change this math block)
+        ax_x = 1 - 2*(y**2 + z**2)
+        ax_y = 2*(x*y + w*z)
+        ax_z = 2*(x*z - w*y)
+        
+        up_x = 2*(x*y - w*z)
+        up_y = 1 - 2*(x**2 + z**2)
+        up_z = 2*(y*z + w*x)
+        
+        # Apply orientation to the 3D model
+        sensor_model.axis = vector(ax_x, ax_y, ax_z)
+        sensor_model.up = vector(up_x, up_y, up_z)
+
+except KeyboardInterrupt:
+    print("\nStopping 3D stream...")
+
+finally:
+    libmetawear.mbl_mw_sensor_fusion_stop(device.board)
+    libmetawear.mbl_mw_sensor_fusion_clear_enabled_mask(device.board)
+    libmetawear.mbl_mw_datasignal_unsubscribe(signal)
+    libmetawear.mbl_mw_debug_reset(device.board)
+    sleep(2.0)
+    print("Hardware disconnected safely.")
